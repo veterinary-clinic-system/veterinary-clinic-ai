@@ -1,0 +1,38 @@
+# veterinary-clinic-ai dependencies
+#
+# NOTE on heavy deps: `torch` and `transformers` are ONLY used by the
+# optional computer-vision triage step (app/services/cv_triage.py), which
+# does zero-shot image classification with a pretrained CLIP model. They
+# are large downloads (torch especially). The service is designed to
+# degrade gracefully without them:
+#   - If ENABLE_CV=false, they are never imported/loaded at all.
+#   - If they ARE enabled but not installed (or the model fails to
+#     download at runtime), cv_triage.classify_photos() catches the
+#     ImportError/exception, logs a warning, and returns None -- the
+#     triage endpoint still returns a valid NLP-only result
+#     (cv_confidence: null) instead of crashing.
+# For a lightweight/NLP-only dev setup you may comment torch/transformers
+# out and run with ENABLE_CV=false.
+
+# --- Web framework -----------------------------------------------------
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+
+# --- Data validation / settings -----------------------------------------
+pydantic==2.10.3
+pydantic-settings==2.7.0
+python-dotenv==1.0.1
+
+# --- HTTP client (LLM calls, photo downloads) ---------------------------
+httpx==0.28.1
+
+# --- Image handling (CV step) -------------------------------------------
+Pillow==11.0.0
+
+# --- Computer vision (CV step only -- heavy, optional at runtime) -------
+transformers==4.47.1
+torch==2.5.1
+
+# --- Testing --------------------------------------------------------------
+pytest==8.3.4
+pytest-asyncio==0.25.0
