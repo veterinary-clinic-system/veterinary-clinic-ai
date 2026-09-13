@@ -19,6 +19,7 @@ uvicorn main:app --reload
 Configuration is read from a `.env` file (via `python-dotenv`) at the repo root. Required variables:
 - `OPENROUTER_API_KEY`, `OPENROUTER_BASE_URL`, `OPENROUTER_MODEL` (optionally `OPENROUTER_REFERER`, `OPENROUTER_TITLE`) — used by `src/extractor.py` to call the DeepSeek model through OpenRouter.
 - `DB_HOST`, `DB_PORT`, `DB_USERNAME`, `DB_PASSWORD`, `DB_DATABASE` — PostgreSQL connection used by `src/db.py`.
+- `CORS_ALLOW_ORIGINS` (optional, default `*`) — comma-separated origins allowed to call the API. The `veterinary-clinic-ai-dashboard` front-end is a separate Vite app, so CORS middleware is always installed in `main.py`.
 
 The app will still start if the database or OpenRouter key is unavailable (startup errors are caught and logged), but the corresponding endpoints will fail at request time.
 
@@ -37,7 +38,7 @@ This is a FastAPI service that diagnoses pet diseases and triages severity from 
 ### The symptom-disease matrix (`data/symptom_disease_matrix.csv`)
 
 A single flat CSV is the entire model: one row per disease, one column per breed/gender/weight-bucket/age-bucket/symptom. On disk every cell is always populated:
-- `BR01..BR04`, `M`, `F` are binary flags (`1` = applicable, `0` = not).
+- `BR01..BR04`, `M`, `F` are binary flags (`1` = applicable, `0` = not). The four breed columns are the four supported species — `BR01` dog, `BR02` cat, `BR03` rabbit, `BR04` hamster — which the LLM reports as `BR001..BR004` and `MatrixEngine.BREED_ALIASES` maps back onto the column names.
 - `W01..W03`, `A01..A03`, `SY001..SYnnn` are integer weights (typically 1–3, occasionally negative to penalize a match); `0` means no association.
 
 `MatrixEngine._load_matrix` parses this into a **sparse** in-memory structure (`matrix_data["diseases"][id] = {breeds, genders, weights, ages, symptoms}`) — zero/blank values are dropped so `predict()`'s coverage/cosine math only sees real associations. `_save_matrix` writes the dense zero-filled format back out, so the on-disk format and the in-memory format intentionally differ; when touching either loader or writer, keep both in sync (see `_parse_binary_flag` / `_parse_int_cols`).
@@ -48,4 +49,17 @@ A single flat CSV is the entire model: one row per disease, one column per breed
 
 ### Other endpoints (`src/router.py`)
 
-`GET /api/v1/matrix` dumps the in-memory matrix; `POST /api/v1/matrix/predict` runs scoring only, from an already-compiled `data-02` payload (skips the LLM call). `MatrixEngine` and `DeepSeekSymptomExtractor` are constructed once as module-level singletons in `src/router.py`, so the matrix CSV is read from disk at import time, not per-request.
+`GET /api/v1/matrix` dumps the in-memory matrix; `POST /api/v1/matrix/predict` runs scoring only, from an already-compiled `data-02` payload (skips the LLM call). `MatrixEngine` and `DeepSeekSymptomExtractor` are constructed once as module-level singletons in `src/router.py`, so the matrix CSV is read from disk at import time, not per-request. The extractor singleton is built inside a `try` — a missing/invalid `OPENROUTER_API_KEY` leaves `extractor is None` and only `/diagnose*` fails (with a 503), so the catalog and matrix endpoints stay usable.
+
+### Dashboard-facing endpoints
+
+These exist for `veterinary-clinic-ai-dashboard`; the three groups map one-to-one onto its three tabs.
+
+- `POST /api/v1/diagnose/detailed` — same pipeline as `/api/v1/diagnose`, but the response adds the compiled `data-02` payload, disease names resolved from the catalog, and the weight adjustments applied by online learning. `/api/v1/diagnose` keeps the exact `data-03` contract; extend the detailed endpoint, not that one.
+- `GET/POST/PUT/DELETE /api/v1/symptoms[/{id}]` and `/api/v1/diseases[/{id}]` — CRUD over the Postgres `symptoms` / `diseases` tables. `POST` generates the next `SYnnn`/`DInnn` code when the caller omits one. **The catalog and the matrix are kept in sync here**: creating a symptom adds a zero-filled matrix column, creating a disease adds a zero-filled row, and deleting either drops the corresponding column/row. Every symptom write also clears `extractor._symptoms_cache` so the next LLM prompt sees the new catalog.
+- `GET /api/v1/matrix/table` — the matrix as a **dense** table (`columns` + `rows` with every cell present), mirroring the CSV layout. This is deliberately different from `GET /api/v1/matrix`, which returns the sparse in-memory form.
+- `PUT /api/v1/matrix/cell` and `PUT /api/v1/matrix/cells` — write one cell / several cells and persist the CSV. Breed and gender columns are binary (0/1); weight, age and symptom columns accept `MatrixEngine.CELL_MIN..CELL_MAX` (−3…3). Note the CSV still contains a few legacy out-of-range values (a `4`, a `5`) that load fine but can no longer be written through the API.
+- `POST /api/v1/matrix/sync` — add-only reconciliation of the matrix against the catalog (also run at startup from `main.py`). It never deletes, so an unreachable or out-of-date database cannot wipe hand-authored weights; removals only happen through the explicit DELETE endpoints.
+- `GET /api/v1/matrix/export` — download the CSV as an attachment. It streams the file from disk rather than re-serialising `matrix_data`, so the download is byte-for-byte what the engine will read back.
+- `POST /api/v1/matrix/reload` — re-read the CSV from disk, for when the file is edited outside the API.
+- `GET /api/v1/meta` (reference codes and media limits) and `GET /api/v1/health` (database / extractor / matrix status).

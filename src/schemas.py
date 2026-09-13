@@ -1,4 +1,4 @@
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -84,3 +84,106 @@ class DiseasePrediction(BaseModel):
 class DiagnosisResponse(BaseModel):
     diseases: List[DiseasePrediction]
     triage_result: TriageResult
+
+
+# ---------------------------------------------------------------------------
+# Catalog (symptoms / diseases) - dashboard CRUD
+# ---------------------------------------------------------------------------
+
+
+class SymptomBase(BaseModel):
+    symptom_name: str = Field(min_length=1, max_length=255)
+    describe: Optional[str] = None
+    common_symptom: bool = False
+
+
+class SymptomCreate(SymptomBase):
+    symptom_id: Optional[str] = Field(
+        default=None,
+        max_length=10,
+        description="Bỏ trống để hệ thống tự sinh mã SYnnn tiếp theo.",
+    )
+
+
+class SymptomUpdate(SymptomBase):
+    pass
+
+
+class Symptom(SymptomBase):
+    symptom_id: str
+
+
+class DiseaseBase(BaseModel):
+    disease_name: str = Field(min_length=1, max_length=255)
+    describe: Optional[str] = None
+
+
+class DiseaseCreate(DiseaseBase):
+    disease_id: Optional[str] = Field(
+        default=None,
+        max_length=10,
+        description="Bỏ trống để hệ thống tự sinh mã DInnn tiếp theo.",
+    )
+
+
+class DiseaseUpdate(DiseaseBase):
+    pass
+
+
+class Disease(DiseaseBase):
+    disease_id: str
+
+
+# ---------------------------------------------------------------------------
+# Matrix editor
+# ---------------------------------------------------------------------------
+
+
+class MatrixColumn(BaseModel):
+    key: str
+    group: str
+    kind: str
+
+
+class MatrixRow(BaseModel):
+    disease: str
+    values: Dict[str, int]
+
+
+class MatrixValueRange(BaseModel):
+    min: int
+    max: int
+
+
+class MatrixTable(BaseModel):
+    columns: List[MatrixColumn]
+    rows: List[MatrixRow]
+    id_column: str
+    value_range: MatrixValueRange
+    csv_path: str
+
+
+class MatrixCellUpdate(BaseModel):
+    disease: str = Field(min_length=1)
+    column: str = Field(min_length=1)
+    value: int
+
+
+class MatrixCellBatchUpdate(BaseModel):
+    updates: List[MatrixCellUpdate] = Field(min_length=1)
+
+
+# ---------------------------------------------------------------------------
+# Detailed diagnosis response (dashboard) - data-03 plus the audit trail
+# ---------------------------------------------------------------------------
+
+
+class DiseasePredictionDetail(DiseasePrediction):
+    disease_name: Optional[str] = None
+
+
+class DiagnosisDetailResponse(BaseModel):
+    diseases: List[DiseasePredictionDetail]
+    triage_result: TriageResult
+    compiled: Dict[str, Any]
+    weight_adjustments: Optional[List[Dict[str, Any]]] = None

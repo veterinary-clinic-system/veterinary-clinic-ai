@@ -1,6 +1,6 @@
 {
     "pet-info": {
-        "breed": "BR001", // BR001 = Chó, BR002 = Mèo
+        "breed": "BR001", // BR001 = Chó, BR002 = Mèo, BR003 = Thỏ, BR004 = Hamster
         "gender": "F", // M = đực, F = cái
         "weight": "W02", // W01 = Nhẹ cân, W02 = Bình thường, W03 = Thừa cân
         "age": "A02" // A01 = Nhỏ, A02 = Trưởng thành, A03 = Già
