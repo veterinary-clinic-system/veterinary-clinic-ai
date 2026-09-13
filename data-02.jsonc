@@ -1,0 +1,34 @@
+{
+    "pet-info": {
+        "breed": "BR001", // BR001 = Chó, BR002 = Mèo
+        "gender": "F", // M = đực, F = cái
+        "weight": "W02", // W01 = Nhẹ cân, W02 = Bình thường, W03 = Thừa cân
+        "age": "A02" // A01 = Nhỏ, A02 = Trưởng thành, A03 = Già
+    },
+    "symptoms": [
+        {
+            "symptom": "SY004",
+            "intensity": 1
+        },
+        {
+            "symptom": "SY008",
+            "intensity": 3
+        },
+        {
+            "symptom": "SY010",
+            "intensity": 2
+        },
+        {
+            "symptom": "SY011",
+            "intensity": 1
+        },
+        {
+            "symptom": "SY012",
+            "intensity": 1
+        }
+    ],
+    "triage_result": {
+        "color_code": "RED", // RED, ORANGE, YELLOW, GREEN, BLUE
+        "reasoning": "Phát hiện triệu chứng co giật mức độ cao"
+    }
+}

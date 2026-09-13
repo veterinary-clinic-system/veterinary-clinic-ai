@@ -1,0 +1,16 @@
+{
+    "diseases": [
+        {
+            "disease": "DI001",
+            "revalence_rate": 0.95
+        },
+        {
+            "disease": "DI002",
+            "revalence_rate": 0.92
+        }
+    ],
+    "triage_result": {
+        "color_code": "RED", // RED, ORANGE, YELLOW, GREEN, BLUE
+        "reasoning": "Phát hiện triệu chứng co giật mức độ cao"
+    }
+}

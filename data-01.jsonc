@@ -1,0 +1,20 @@
+{
+    "pet-info": {
+        "breed": "Chó",
+        "specie": "Chó cỏ",
+        "gender": "F",
+        "weight": 15,
+        "age": 5
+    },
+    "symptoms": [
+        "SY004",
+        "SY008",
+        "SY010",
+        "SY012"
+    ],
+    "describe": "Chó mẹ vừa mới sinh con, sốt cao nhiều ngày",
+    "diseases": [
+        "DI010"
+    ] //This is option, for model learning.
+    // (Optional) And images (max 5 files and max size 5MB/file), video (max 2 files and max size 100MB/file) in api request
+}
