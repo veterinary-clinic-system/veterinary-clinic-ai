@@ -1,9 +1,11 @@
 import logging
 import os
+import secrets
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 load_dotenv()
 
@@ -61,6 +63,35 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def authenticate_api(request: Request, call_next):
+    """Require the shared service token for non-public AI endpoints."""
+    service_token = os.getenv("AI_SERVICE_TOKEN", "").strip()
+    public_paths = {"/api/v1/health", "/api/v1/meta"}
+
+    if (
+        service_token
+        and request.method != "OPTIONS"
+        and request.url.path.startswith("/api/v1/")
+        and request.url.path not in public_paths
+    ):
+        authorization = request.headers.get("Authorization", "")
+        scheme, _, supplied_token = authorization.partition(" ")
+        valid = (
+            scheme.lower() == "bearer"
+            and supplied_token
+            and secrets.compare_digest(supplied_token, service_token)
+        )
+        if not valid:
+            return JSONResponse(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                content={"detail": "Invalid or missing AI service token."},
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+    return await call_next(request)
 
 app.include_router(router)
 

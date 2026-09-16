@@ -7,8 +7,8 @@ class PetInfoInput(BaseModel):
     breed: str
     specie: Optional[str] = None
     gender: str
-    weight: float
-    age: float
+    weight: Optional[float] = None
+    age: Optional[float] = None
 
 
 class DiagnosisRequest(BaseModel):

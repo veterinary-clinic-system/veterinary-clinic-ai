@@ -5,6 +5,8 @@ import logging
 import os
 import re
 import tempfile
+import urllib.request
+from urllib.parse import urlparse
 from typing import Any, Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
@@ -19,6 +21,7 @@ logger = logging.getLogger(__name__)
 
 SUPPORTED_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}
 SUPPORTED_VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
+MAX_REMOTE_VIDEO_BYTES = 100 * 1024 * 1024
 
 
 class DeepSeekSymptomExtractor:
@@ -72,15 +75,17 @@ Nhiệm vụ của bạn là tiếp nhận thông tin thú cưng (loài, giống
 
 1. CHUẨN HÓA THÔNG TIN THÚ CƯNG (`pet-info`):
 - `breed`: Chuẩn hóa loài sang mã: "BR001" (Chó), "BR002" (Mèo), "BR003" (Thỏ), "BR004" (Hamster).
-- `gender`: "M" (đực / male), "F" (cái / female).
+- `gender`: "M" (đực / male), "F" (cái / female), "U" nếu không có dữ liệu. Không tự đoán giới tính.
 - `weight`: Phân loại thể trạng cân nặng:
   * "W01": Nhẹ cân (Underweight)
   * "W02": Bình thường (Normal)
   * "W03": Thừa cân / Béo phì (Overweight)
+  * "W00": Không đủ dữ liệu cân nặng để phân loại
 - `age`: Phân loại độ tuổi:
   * "A01": Nhỏ / con non (dưới 1 tuổi)
   * "A02": Trưởng thành (từ 1 đến 7 tuổi)
   * "A03": Già / cao tuổi (trên 7 tuổi)
+  * "A00": Không có dữ liệu tuổi
 
 2. TỔNG HỢP VÀ ĐÁNH GIÁ MỨC ĐỘ TRIỆU CHỨNG (`symptoms`):
 - Kết hợp toàn diện: danh sách mã triệu chứng input người dùng đã chọn + triệu chứng trích xuất từ văn bản mô tả (`describe`) + triệu chứng quan sát được qua ảnh và video.
@@ -176,6 +181,31 @@ QUY TẮC ĐẦU RA:
             cap.release()
         return frames
 
+    def _download_cloudinary_video(self, url: str) -> Optional[str]:
+        """Download a trusted Cloudinary video URL to a bounded temporary file."""
+        parsed = urlparse(url)
+        if parsed.scheme != "https" or parsed.hostname != "res.cloudinary.com":
+            logger.warning("Skipping non-Cloudinary video URL")
+            return None
+
+        ext = os.path.splitext(parsed.path)[1].lower()
+        if ext not in SUPPORTED_VIDEO_EXTS:
+            logger.warning("Skipping unsupported remote video format: %s", ext or "unknown")
+            return None
+
+        request = urllib.request.Request(url, headers={"User-Agent": "VetCare-AI/1.0"})
+        with urllib.request.urlopen(request, timeout=30) as response:
+            content_length = int(response.headers.get("Content-Length") or 0)
+            if content_length > MAX_REMOTE_VIDEO_BYTES:
+                raise ValueError("Remote video exceeds the 100 MB limit")
+            video_bytes = response.read(MAX_REMOTE_VIDEO_BYTES + 1)
+            if len(video_bytes) > MAX_REMOTE_VIDEO_BYTES:
+                raise ValueError("Remote video exceeds the 100 MB limit")
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+            tmp.write(video_bytes)
+            return tmp.name
+
     async def process_inputs(
         self,
         pet_info: PetInfoInput,
@@ -242,7 +272,20 @@ QUY TẮC ĐẦU RA:
                     if not vid_item or not isinstance(vid_item, str):
                         continue
                     vid_str = vid_item.strip()
-                    if os.path.exists(vid_str):
+                    if vid_str.startswith("https://"):
+                        try:
+                            tmp_path = self._download_cloudinary_video(vid_str)
+                            if tmp_path:
+                                temp_paths.append(tmp_path)
+                                frames = self._extract_video_frames(tmp_path)
+                                for frame_b64 in frames:
+                                    content_parts.append({
+                                        "type": "image_url",
+                                        "image_url": {"url": f"data:image/jpeg;base64,{frame_b64}"}
+                                    })
+                        except Exception as e:
+                            logger.warning(f"Error downloading remote video: {e}")
+                    elif os.path.exists(vid_str):
                         frames = self._extract_video_frames(vid_str)
                         for frame_b64 in frames:
                             content_parts.append({

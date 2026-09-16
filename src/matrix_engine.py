@@ -3,6 +3,7 @@ import logging
 import math
 import os
 import re
+import shutil
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -11,7 +12,10 @@ _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # Resolved against the project root so the engine works no matter which
 # directory uvicorn was started from.
-DEFAULT_CSV_PATH = os.path.join(_PROJECT_ROOT, "data", "symptom_disease_matrix.csv")
+_BUNDLED_CSV_PATH = os.path.join(
+    _PROJECT_ROOT, "data", "symptom_disease_matrix.csv"
+)
+DEFAULT_CSV_PATH = os.getenv("MATRIX_CSV_PATH", _BUNDLED_CSV_PATH)
 
 
 class MatrixEngine:
@@ -20,7 +24,22 @@ class MatrixEngine:
     def __init__(self, csv_path: str = DEFAULT_CSV_PATH):
         self.csv_path = csv_path
         self.matrix_data: Dict[str, Any] = {}
+        self._initialize_external_matrix()
         self._load_matrix()
+
+    def _initialize_external_matrix(self) -> None:
+        """Seed an empty persistent-disk path from the bundled matrix."""
+        if os.path.exists(self.csv_path) or self.csv_path == _BUNDLED_CSV_PATH:
+            return
+
+        if not os.path.exists(_BUNDLED_CSV_PATH):
+            return
+
+        parent_dir = os.path.dirname(self.csv_path)
+        if parent_dir:
+            os.makedirs(parent_dir, exist_ok=True)
+        shutil.copyfile(_BUNDLED_CSV_PATH, self.csv_path)
+        logger.info("Seeded matrix file at %s", self.csv_path)
 
     # Column groups in the flat CSV
     BREED_COLS = ["BR01", "BR02", "BR03", "BR04"]
@@ -211,7 +230,7 @@ class MatrixEngine:
 
     def _normalize_breed(self, breed: Optional[str]) -> str:
         if not breed:
-            return "BR01"
+            return ""
 
         breed = breed.strip().upper()
 
@@ -219,13 +238,18 @@ class MatrixEngine:
             if breed in aliases:
                 return column
 
-        return breed
+        return ""
 
     def _normalize_gender(self, gender: Optional[str]) -> str:
         if not gender:
-            return "M"
+            return ""
 
-        return "F" if gender.strip().upper() in {"F", "FEMALE"} else "M"
+        normalized = gender.strip().upper()
+        if normalized in {"F", "FEMALE"}:
+            return "F"
+        if normalized in {"M", "MALE"}:
+            return "M"
+        return ""
 
     def predict(
         self,
@@ -268,10 +292,10 @@ class MatrixEngine:
             breeds = disease.get("breeds", [])
             genders = disease.get("genders", [])
 
-            if breeds and breed not in breeds:
+            if breeds and breed and breed not in breeds:
                 continue
 
-            if genders and gender not in genders:
+            if genders and gender and gender not in genders:
                 continue
 
             disease_symptoms = disease.get("symptoms", {})
@@ -395,10 +419,10 @@ class MatrixEngine:
             breed = self._normalize_breed(pet_info.get("breed"))
             gender = self._normalize_gender(pet_info.get("gender"))
 
-            if breed not in disease["breeds"]:
+            if breed and breed not in disease["breeds"]:
                 disease["breeds"].append(breed)
 
-            if gender not in disease["genders"]:
+            if gender and gender not in disease["genders"]:
                 disease["genders"].append(gender)
 
         if save:
