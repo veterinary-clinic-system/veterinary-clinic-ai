@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -187,3 +187,23 @@ class DiagnosisDetailResponse(BaseModel):
     triage_result: TriageResult
     compiled: Dict[str, Any]
     weight_adjustments: Optional[List[Dict[str, Any]]] = None
+
+
+# ---------------------------------------------------------------------------
+# General pet-care Q&A (chat assistant fallback)
+# ---------------------------------------------------------------------------
+
+
+class AskHistoryItem(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str = Field(max_length=2000)
+
+
+class AskRequest(BaseModel):
+    question: str = Field(min_length=1, max_length=1000)
+    history: List[AskHistoryItem] = Field(default_factory=list, max_length=10)
+
+
+class AskResponse(BaseModel):
+    answer: str
+    suggest_visit: bool = False

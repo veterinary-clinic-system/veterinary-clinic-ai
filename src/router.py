@@ -3,6 +3,7 @@ import os
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Body, HTTPException, Path, status
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
 
 from src.db import (
@@ -21,6 +22,8 @@ from src.db import (
 from src.extractor import DeepSeekSymptomExtractor
 from src.matrix_engine import MatrixEngine
 from src.schemas import (
+    AskRequest,
+    AskResponse,
     CompiledExtractionOutput,
     DiagnosisDetailResponse,
     DiagnosisRequest,
@@ -254,6 +257,29 @@ async def diagnose_detailed_endpoint(
         compiled=compiled,
         weight_adjustments=adjustments,
     )
+
+
+@router.post(
+    "/api/v1/ask",
+    response_model=AskResponse,
+    summary="Trả lời câu hỏi chăm sóc thú cưng tổng quát (LLM)",
+    tags=["Chat"],
+)
+async def ask_pet_care_endpoint(request_data: AskRequest) -> AskResponse:
+    ex = _require_extractor()
+    try:
+        result = await run_in_threadpool(
+            ex.answer_pet_care_question,
+            request_data.question,
+            [item.model_dump() for item in request_data.history],
+        )
+    except Exception as exc:
+        logger.error("Pet-care Q&A failed: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Không gọi được mô hình ngôn ngữ để trả lời.",
+        )
+    return AskResponse(**result)
 
 
 @router.get(

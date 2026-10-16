@@ -37,6 +37,16 @@ def init_db() -> None:
                     ground_truth_diseases JSONB,
                     weight_adjustments JSONB
                 );
+
+                CREATE TABLE IF NOT EXISTS symptoms (
+                    symptom_id VARCHAR(50) PRIMARY KEY,
+                    symptom_name VARCHAR(255) NOT NULL,
+                    describe TEXT,
+                    common_symptom BOOLEAN DEFAULT FALSE
+                );
+
+                ALTER TABLE diseases ADD COLUMN IF NOT EXISTS disease_id VARCHAR(50);
+                ALTER TABLE diseases ADD COLUMN IF NOT EXISTS describe TEXT;
                 """
             )
 
@@ -103,6 +113,7 @@ def fetch_diseases() -> List[Dict[str, Any]]:
                 """
                 SELECT disease_id, disease_name, describe
                 FROM diseases
+                WHERE disease_id IS NOT NULL
                 ORDER BY disease_id;
                 """
             )
