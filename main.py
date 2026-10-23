@@ -46,7 +46,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Pet Disease Diagnosis & Triage API",
-    description="API dự đoán bệnh thú cưng và phân loại cấp cứu - DeepSeek V4.1-Flash (OpenRouter) & Symptom-Disease Matrix",
+    description="API dự đoán bệnh thú cưng và phân loại cấp cứu - Jev (TypeSafe, OpenRouter) & Symptom-Disease Matrix",
     version="2.0.0",
     lifespan=lifespan,
 )

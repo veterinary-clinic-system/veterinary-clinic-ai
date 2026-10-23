@@ -2,16 +2,18 @@ import base64
 import io
 import json
 import logging
+import math
 import os
 import re
 import tempfile
 import urllib.request
 from urllib.parse import urlparse
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
+import httpx
 from dotenv import load_dotenv
 from openai import OpenAI
-from PIL import Image
+from PIL import Image, ImageOps
 
 from src.db import fetch_symptoms
 from src.schemas import CompiledExtractionOutput, PetInfoInput
@@ -21,7 +23,16 @@ logger = logging.getLogger(__name__)
 
 SUPPORTED_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}
 SUPPORTED_VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
+MAX_REMOTE_IMAGE_BYTES = 5 * 1024 * 1024
 MAX_REMOTE_VIDEO_BYTES = 100 * 1024 * 1024
+
+JEV_TIMEOUT_SECONDS = 60
+# Jev only accepts images whose sides are 256-1568 px and whose area is at
+# least 78,400 px (smaller -> HTTP 400, larger -> 413), and it ignores EXIF
+# orientation, so every image is rotated and resized before it is sent.
+JEV_IMAGE_MIN_SIDE = 256
+JEV_IMAGE_MAX_SIDE = 1568
+JEV_IMAGE_MIN_PIXELS = 78_400
 
 
 
@@ -37,14 +48,68 @@ QUY TẮC:
 Trả về DUY NHẤT một JSON hợp lệ: {"answer": "<câu trả lời>", "suggest_visit": true|false}"""
 
 
-class DeepSeekSymptomExtractor:
-    """Pet symptom compiler and triage extractor using DeepSeek V4.1-Flash served via OpenRouter."""
+# ---------------------------------------------------------------------------
+# Jev question vocabulary. Jev never sees the question id, so each
+# instruction and criterion has to make sense on its own.
+# ---------------------------------------------------------------------------
 
-    def __init__(
-        self,
-        max_video_frames: int = 5,
-        max_image_side: int = 2048,
-    ):
+BREED_CRITERIA = {
+    "BR001": "Chó (dog), thuộc bất kỳ giống chó nào",
+    "BR002": "Mèo (cat), thuộc bất kỳ giống mèo nào",
+    "BR003": "Thỏ (rabbit)",
+    "BR004": "Hamster (chuột hamster)",
+}
+
+GENDER_CRITERIA = {
+    "M": "Đực (male)",
+    "F": "Cái (female)",
+    "U": "Không có dữ liệu giới tính hoặc dữ liệu không rõ ràng",
+}
+
+WEIGHT_CRITERIA = {
+    "W01": "Nhẹ cân (underweight) so với chuẩn của loài, giống và độ tuổi",
+    "W02": "Bình thường (normal) so với chuẩn của loài, giống và độ tuổi",
+    "W03": "Thừa cân / béo phì (overweight) so với chuẩn của loài, giống và độ tuổi",
+}
+
+TRIAGE_CRITERIA = {
+    "RED": (
+        "Cực kỳ nguy kịch / Cấp cứu tối khẩn (đe dọa tính mạng ngay lập tức: co giật "
+        "nặng, khó thở tím tái, sùi bọt mép, xuất huyết cấp, sốt sữa cấp...)"
+    ),
+    "ORANGE": "Nguy cơ cao / Khẩn cấp (mệt lả nặng, đau đớn dữ dội, mất nước nghiêm trọng...)",
+    "YELLOW": "Bán khẩn (cần thăm khám trong ngày: nôn tiêu chảy nhẹ, sốt vừa, mẩn ngứa...)",
+    "GREEN": "Ít khẩn cấp / Ổn định (triệu chứng nhẹ, tiến triển mạn tính)",
+    "BLUE": "Không khẩn cấp (chăm sóc thông thường)",
+}
+
+TRIAGE_LABELS = {
+    "RED": "Tối khẩn",
+    "ORANGE": "Khẩn cấp",
+    "YELLOW": "Bán khẩn",
+    "GREEN": "Ổn định",
+    "BLUE": "Không khẩn cấp",
+}
+
+# Ordered score levels. The severity scale starts at intensity 1; on the
+# presence scale level 0 means "absent" and levels 1-3 are the intensities.
+SEVERITY_LEVELS = [
+    "Nhẹ (mild): biểu hiện nhẹ hoặc thoáng qua",
+    "Vừa (moderate): biểu hiện rõ, ảnh hưởng đến ăn uống, sinh hoạt",
+    "Nặng (severe): biểu hiện dữ dội, kéo dài hoặc đe dọa tính mạng",
+]
+PRESENCE_LEVELS = [
+    "Không có (absent): không có dấu hiệu hay thông tin nào cho thấy triệu chứng này",
+    *SEVERITY_LEVELS,
+]
+
+INTENSITY_LABELS = {1: "nhẹ", 2: "vừa", 3: "nặng"}
+
+
+class JevSymptomExtractor:
+    """Pet symptom compiler and triage extractor using TypeSafe's Jev decision model via OpenRouter."""
+
+    def __init__(self, max_video_frames: int = 5):
         api_key = os.getenv("OPENROUTER_API_KEY")
         if not api_key:
             raise ValueError("OPENROUTER_API_KEY is missing from .env")
@@ -55,14 +120,24 @@ class DeepSeekSymptomExtractor:
         if os.getenv("OPENROUTER_TITLE"):
             default_headers["X-OpenRouter-Title"] = os.getenv("OPENROUTER_TITLE")
 
+        # Jev is a decision model: it answers typed questions through the
+        # Decisions API instead of /chat/completions.
+        self.decisions_url = (
+            os.getenv("OPENROUTER_DECISIONS_URL")
+            or "https://openrouter.ai/api/alpha/decisions"
+        )
+        self.decisions_headers = {"Authorization": f"Bearer {api_key}", **default_headers}
+        self.model_name = os.getenv("OPENROUTER_JEV_MODEL") or "typesafe/jev-1.14"
+        self.symptom_threshold = float(os.getenv("JEV_SYMPTOM_THRESHOLD") or 0.5)
+
+        # Jev cannot write text, so the pet-care chat keeps a generative model.
         self.client = OpenAI(
             api_key=api_key,
-            base_url=os.getenv("OPENROUTER_BASE_URL"),
+            base_url=os.getenv("OPENROUTER_BASE_URL") or "https://openrouter.ai/api/v1",
             default_headers=default_headers or None,
         )
-        self.model_name = os.getenv("OPENROUTER_MODEL")
+        self.chat_model_name = os.getenv("OPENROUTER_CHAT_MODEL") or "typesafe/jev-router"
         self.max_video_frames = max_video_frames
-        self.max_image_side = max_image_side
 
         # Fetch symptoms from database
         self._symptoms_cache: Optional[List[Dict[str, Any]]] = None
@@ -74,78 +149,9 @@ class DeepSeekSymptomExtractor:
                 self._symptoms_cache = fetch_symptoms()
             except Exception as e:
                 logger.error(f"Failed to fetch symptoms from PostgreSQL: {e}")
-                # Fallback to empty list or static if DB is temporarily unreachable
-                self._symptoms_cache = []
+                # Without a catalog Jev gets no symptom questions; retry on the next call.
+                return []
         return self._symptoms_cache
-
-    def _build_system_instruction(self) -> str:
-        symptoms = self.get_symptoms_context()
-        symptoms_str = json.dumps(symptoms, ensure_ascii=False, indent=2)
-
-        return f"""
-Bạn là một chuyên gia thú y và chuyên gia phân tích triệu chứng thú cưng (Pet Triage & Symptom Extractor).
-Nhiệm vụ của bạn là tiếp nhận thông tin thú cưng (loài, giống, giới tính, cân nặng, tuổi), các triệu chứng người dùng cung cấp ban đầu, đoạn văn mô tả lâm sàng, cùng hình ảnh hoặc video (nếu có), sau đó:
-
-1. CHUẨN HÓA THÔNG TIN THÚ CƯNG (`pet-info`):
-- `breed`: Chuẩn hóa loài sang mã: "BR001" (Chó), "BR002" (Mèo), "BR003" (Thỏ), "BR004" (Hamster).
-- `gender`: "M" (đực / male), "F" (cái / female), "U" nếu không có dữ liệu. Không tự đoán giới tính.
-- `weight`: Phân loại thể trạng cân nặng:
-  * "W01": Nhẹ cân (Underweight)
-  * "W02": Bình thường (Normal)
-  * "W03": Thừa cân / Béo phì (Overweight)
-  * "W00": Không đủ dữ liệu cân nặng để phân loại
-- `age`: Phân loại độ tuổi:
-  * "A01": Nhỏ / con non (dưới 1 tuổi)
-  * "A02": Trưởng thành (từ 1 đến 7 tuổi)
-  * "A03": Già / cao tuổi (trên 7 tuổi)
-  * "A00": Không có dữ liệu tuổi
-
-2. TỔNG HỢP VÀ ĐÁNH GIÁ MỨC ĐỘ TRIỆU CHỨNG (`symptoms`):
-- Kết hợp toàn diện: danh sách mã triệu chứng input người dùng đã chọn + triệu chứng trích xuất từ văn bản mô tả (`describe`) + triệu chứng quan sát được qua ảnh và video.
-- Đối với mỗi triệu chứng phát hiện được, gán mức độ nghiêm trọng `intensity`:
-  * 1: Nhẹ (Mild)
-  * 2: Vừa (Moderate)
-  * 3: Nặng (Severe)
-- CHỈ ĐƯỢC DÙNG mã `symptom_id` (ví dụ: "SY001", "SY004", "SY008", ...) có trong DANH MỤC TRIỆU CHỨNG dưới đây. Tuyệt đối không tự bịa mã mới.
-
-3. PHÂN LOẠI CẤP CỨU (`triage_result`):
-- `color_code`: Đánh giá thang màu cấp cứu thú y:
-  * "RED": Cực kỳ nguy kịch / Cấp cứu tối khẩn (đe dọa tính mạng ngay lập tức: co giật nặng, khó thở tím tái, sùi bọt mép, xuất huyết cấp, sốt sữa cấp...).
-  * "ORANGE": Nguy cơ cao / Khẩn cấp (mệt lả nặng, đau đớn dữ dội, mất nước nghiêm trọng...).
-  * "YELLOW": Bán khẩn (cần thăm khám trong ngày: nôn tiêu chảy nhẹ, sốt vừa, mẩn ngứa...).
-  * "GREEN": Ít khẩn cấp / Ổn định (triệu chứng nhẹ, tiến triển mạn tính).
-  * "BLUE": Không khẩn cấp (chăm sóc thông thường).
-- `reasoning`: Giải thích ngắn gọn lý do phân loại cấp cứu bằng tiếng Việt (ví dụ: "Phát hiện triệu chứng co giật mức độ cao").
-
-=== DANH MỤC TRIỆU CHỨNG HỆ THỐNG (TỪ DATABASE) ===
-{symptoms_str}
-=================================================
-
-QUY TẮC ĐẦU RA:
-- Trả về DUY NHẤT một chuỗi JSON hợp lệ đúng chuẩn theo định dạng mẫu sau (phải chứa từ khóa json):
-{{
-  "pet-info": {{
-    "breed": "BR001",
-    "gender": "F",
-    "weight": "W02",
-    "age": "A02"
-  }},
-  "symptoms": [
-    {{
-      "symptom": "SY004",
-      "intensity": 1
-    }},
-    {{
-      "symptom": "SY008",
-      "intensity": 3
-    }}
-  ],
-  "triage_result": {{
-    "color_code": "RED",
-    "reasoning": "Phát hiện triệu chứng co giật mức độ cao"
-  }}
-}}
-"""
 
     def answer_pet_care_question(
         self, question: str, history: Optional[List[Dict[str, str]]] = None
@@ -160,7 +166,7 @@ QUY TẮC ĐẦU RA:
         messages.append({"role": "user", "content": question})
 
         response = self.client.chat.completions.create(
-            model=self.model_name,
+            model=self.chat_model_name,
             messages=messages,
             response_format={"type": "json_object"},
             temperature=0.3,
@@ -172,7 +178,7 @@ QUY TẮC ĐẦU RA:
             content = re.sub(r"^```[a-zA-Z]*\n?", "", content)
             content = re.sub(r"\n?```$", "", content).strip()
         if not content:
-            raise ValueError("DeepSeek returned an empty response.")
+            raise ValueError("The chat model returned an empty response.")
         try:
             data = json.loads(content)
             answer = str(data.get("answer", "")).strip()
@@ -180,18 +186,42 @@ QUY TẮC ĐẦU RA:
         except (ValueError, AttributeError):
             answer, suggest_visit = content, False
         if not answer:
-            raise ValueError("DeepSeek returned an empty answer.")
+            raise ValueError("The chat model returned an empty answer.")
         return {"answer": answer, "suggest_visit": suggest_visit}
 
+    @staticmethod
+    def _fit_image_size(width: int, height: int) -> Optional[Tuple[int, int]]:
+        """Scale a size into the range Jev accepts, keeping the aspect ratio.
+
+        Returns None when no single scale satisfies every limit (very elongated images).
+        """
+        scale = min(1.0, JEV_IMAGE_MAX_SIDE / max(width, height))
+        scale = max(
+            scale,
+            JEV_IMAGE_MIN_SIDE / min(width, height),
+            math.sqrt(JEV_IMAGE_MIN_PIXELS / (width * height)),
+        )
+        rounding = math.ceil if scale > 1 else round
+        new_width, new_height = rounding(width * scale), rounding(height * scale)
+        if (
+            min(new_width, new_height) < JEV_IMAGE_MIN_SIDE
+            or max(new_width, new_height) > JEV_IMAGE_MAX_SIDE
+            or new_width * new_height < JEV_IMAGE_MIN_PIXELS
+        ):
+            return None
+        return new_width, new_height
+
     def _encode_image(self, file_bytes: bytes) -> Optional[str]:
-        """Convert image bytes to a base64 JPEG data URL."""
+        """Convert image bytes to a base64 JPEG data URL sized for Jev."""
         try:
             with Image.open(io.BytesIO(file_bytes)) as img:
                 img.load()
-                img = img.convert("RGB")
-                if max(img.size) > self.max_image_side:
-                    ratio = self.max_image_side / max(img.size)
-                    new_size = (int(img.width * ratio), int(img.height * ratio))
+                img = ImageOps.exif_transpose(img).convert("RGB")
+                new_size = self._fit_image_size(*img.size)
+                if new_size is None:
+                    logger.warning(f"Skipping image with unsupported proportions: {img.size}")
+                    return None
+                if new_size != img.size:
                     img = img.resize(new_size, Image.LANCZOS)
                 buffer = io.BytesIO()
                 img.save(buffer, format="JPEG", quality=85)
@@ -201,8 +231,8 @@ QUY TẮC ĐẦU RA:
             logger.warning(f"Could not open or process image bytes: {e}")
             return None
 
-    def _extract_video_frames(self, video_path: str) -> List[str]:
-        """Sample up to max_video_frames frames from video and return as base64 JPEG strings."""
+    def _extract_video_frames(self, video_path: str) -> List[bytes]:
+        """Sample up to max_video_frames frames from video and return them as JPEG bytes."""
         import cv2
 
         frames = []
@@ -222,38 +252,300 @@ QUY TẮC ĐẦU RA:
                 if not ok:
                     break
                 if idx in indices and len(frames) < max_frames:
-                    ok_enc, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                    # High quality: _encode_image re-encodes every frame anyway.
+                    ok_enc, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
                     if ok_enc:
-                        frames.append(base64.b64encode(buf.tobytes()).decode("utf-8"))
+                        frames.append(buf.tobytes())
                 idx += 1
         finally:
             cap.release()
         return frames
 
-    def _download_cloudinary_video(self, url: str) -> Optional[str]:
-        """Download a trusted Cloudinary video URL to a bounded temporary file."""
+    def _download_cloudinary(self, url: str, max_bytes: int) -> Optional[bytes]:
+        """Download a trusted Cloudinary URL, refusing anything over max_bytes."""
         parsed = urlparse(url)
         if parsed.scheme != "https" or parsed.hostname != "res.cloudinary.com":
-            logger.warning("Skipping non-Cloudinary video URL")
+            logger.warning("Skipping non-Cloudinary media URL")
             return None
 
-        ext = os.path.splitext(parsed.path)[1].lower()
+        limit_mb = max_bytes // (1024 * 1024)
+        request = urllib.request.Request(url, headers={"User-Agent": "VetCare-AI/1.0"})
+        with urllib.request.urlopen(request, timeout=30) as response:
+            content_length = int(response.headers.get("Content-Length") or 0)
+            if content_length > max_bytes:
+                raise ValueError(f"Remote file exceeds the {limit_mb} MB limit")
+            data = response.read(max_bytes + 1)
+            if len(data) > max_bytes:
+                raise ValueError(f"Remote file exceeds the {limit_mb} MB limit")
+        return data
+
+    def _download_cloudinary_video(self, url: str) -> Optional[str]:
+        """Download a trusted Cloudinary video URL to a bounded temporary file."""
+        ext = os.path.splitext(urlparse(url).path)[1].lower()
         if ext not in SUPPORTED_VIDEO_EXTS:
             logger.warning("Skipping unsupported remote video format: %s", ext or "unknown")
             return None
 
-        request = urllib.request.Request(url, headers={"User-Agent": "VetCare-AI/1.0"})
-        with urllib.request.urlopen(request, timeout=30) as response:
-            content_length = int(response.headers.get("Content-Length") or 0)
-            if content_length > MAX_REMOTE_VIDEO_BYTES:
-                raise ValueError("Remote video exceeds the 100 MB limit")
-            video_bytes = response.read(MAX_REMOTE_VIDEO_BYTES + 1)
-            if len(video_bytes) > MAX_REMOTE_VIDEO_BYTES:
-                raise ValueError("Remote video exceeds the 100 MB limit")
+        video_bytes = self._download_cloudinary(url, MAX_REMOTE_VIDEO_BYTES)
+        if video_bytes is None:
+            return None
 
         with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
             tmp.write(video_bytes)
             return tmp.name
+
+    def _image_from_string(self, value: str) -> Optional[str]:
+        """Load an image given as a data URL, Cloudinary URL, local path or raw base64."""
+        try:
+            if value.startswith("data:image/"):
+                image_bytes = base64.b64decode(value.split(",", 1)[-1])
+            elif value.startswith(("http://", "https://")):
+                # Jev does not fetch remote URLs, so the image is downloaded here.
+                image_bytes = self._download_cloudinary(value, MAX_REMOTE_IMAGE_BYTES)
+            elif os.path.exists(value):
+                with open(value, "rb") as f:
+                    image_bytes = f.read()
+            else:
+                # Raw base64 string
+                image_bytes = base64.b64decode(value)
+        except Exception as e:
+            logger.warning(f"Could not load image input: {e}")
+            return None
+        return self._encode_image(image_bytes) if image_bytes else None
+
+    def _collect_image_urls(
+        self,
+        images: Optional[List[str]],
+        videos: Optional[List[str]],
+        image_files: Optional[List[Tuple[str, bytes]]],
+        video_files: Optional[List[Tuple[str, bytes]]],
+    ) -> List[str]:
+        """Encode the case's images and sampled video frames as Jev-ready data URLs."""
+        image_urls: List[Optional[str]] = []
+        frames: List[bytes] = []
+        temp_paths: List[str] = []
+
+        try:
+            # 1. Images from string list (base64 data URIs, Cloudinary URLs, or local paths)
+            for img_item in (images or [])[:5]:
+                if img_item and isinstance(img_item, str):
+                    image_urls.append(self._image_from_string(img_item.strip()))
+
+            # 2. Images from multipart files (max 5)
+            for filename, img_bytes in (image_files or [])[:5]:
+                ext = os.path.splitext(filename)[1].lower()
+                if ext in SUPPORTED_IMAGE_EXTS:
+                    image_urls.append(self._encode_image(img_bytes))
+                else:
+                    logger.warning(f"Skipping unsupported image format: {filename}")
+
+            # 3. Videos from string list (Cloudinary URLs, local paths or base64).
+            # Jev reads no video, so a few sampled frames are sent as images.
+            for vid_item in (videos or [])[:2]:
+                if not vid_item or not isinstance(vid_item, str):
+                    continue
+                vid_str = vid_item.strip()
+                if vid_str.startswith("https://"):
+                    try:
+                        tmp_path = self._download_cloudinary_video(vid_str)
+                        if tmp_path:
+                            temp_paths.append(tmp_path)
+                            frames.extend(self._extract_video_frames(tmp_path))
+                    except Exception as e:
+                        logger.warning(f"Error downloading remote video: {e}")
+                elif os.path.exists(vid_str):
+                    frames.extend(self._extract_video_frames(vid_str))
+                elif vid_str.startswith("data:video/") or len(vid_str) > 100:
+                    # Decode base64 to temp file
+                    try:
+                        raw_bytes = base64.b64decode(vid_str.split(",", 1)[-1])
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
+                            tmp.write(raw_bytes)
+                            tmp_path = tmp.name
+                            temp_paths.append(tmp_path)
+                        frames.extend(self._extract_video_frames(tmp_path))
+                    except Exception as e:
+                        logger.warning(f"Error decoding video base64: {e}")
+
+            # 4. Videos from multipart files (max 2)
+            for filename, vid_bytes in (video_files or [])[:2]:
+                ext = os.path.splitext(filename)[1].lower()
+                if ext in SUPPORTED_VIDEO_EXTS:
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+                        tmp.write(vid_bytes)
+                        tmp_path = tmp.name
+                        temp_paths.append(tmp_path)
+                    frames.extend(self._extract_video_frames(tmp_path))
+                else:
+                    logger.warning(f"Skipping unsupported video format: {filename}")
+
+            image_urls.extend(self._encode_image(frame) for frame in frames)
+        finally:
+            for p in temp_paths:
+                if os.path.exists(p):
+                    try:
+                        os.remove(p)
+                    except Exception:
+                        pass
+
+        return [url for url in image_urls if url]
+
+    def _build_questions(
+        self,
+        pet_info: PetInfoInput,
+        catalog: List[Dict[str, Any]],
+        selected: Set[str],
+    ) -> Tuple[Dict[str, Any], Dict[str, str]]:
+        """Build the Jev questions, plus a map of symptom question id -> symptom_id."""
+        questions: Dict[str, Any] = {
+            "breed": {
+                "type": "choice",
+                "instructions": (
+                    "Thú cưng trong ca bệnh thuộc loài nào? Dựa vào `pet-info.breed`, "
+                    "`pet-info.specie` và hình ảnh (nếu có)."
+                ),
+                "criteria": BREED_CRITERIA,
+            },
+            "gender": {
+                "type": "choice",
+                "instructions": (
+                    "Giới tính của thú cưng là gì? Dựa vào `pet-info.gender` (có thể ghi bằng "
+                    "tiếng Việt hoặc tiếng Anh) hoặc thông tin nêu rõ trong `describe`; "
+                    "không tự đoán."
+                ),
+                "criteria": GENDER_CRITERIA,
+            },
+            "triage": {
+                "type": "choice",
+                "instructions": (
+                    "Theo thang phân loại cấp cứu thú y, ca bệnh này khẩn cấp ở mức nào? "
+                    "Xét toàn bộ thông tin thú cưng, `selected_symptoms`, `describe` và "
+                    "hình ảnh, khung hình video (nếu có)."
+                ),
+                "criteria": TRIAGE_CRITERIA,
+            },
+        }
+        if pet_info.weight is not None and pet_info.weight > 0:
+            questions["weight"] = {
+                "type": "choice",
+                "instructions": (
+                    "Với loài, giống và tuổi của thú cưng, cân nặng `pet-info.weight` "
+                    "cho thấy thể trạng nào?"
+                ),
+                "criteria": WEIGHT_CRITERIA,
+            }
+
+        # One score question per catalog symptom, so Jev can only report known codes.
+        symptom_questions: Dict[str, str] = {}
+        for index, row in enumerate(catalog):
+            question_id = f"symptom_{index}"
+            symptom = f"«{row['symptom_name']}»"
+            if row.get("describe"):
+                symptom += f" ({row['describe']})"
+
+            if row["symptom_id"] in selected:
+                questions[question_id] = {
+                    "type": "score",
+                    "instructions": (
+                        f"Chủ nuôi đã xác nhận thú cưng có triệu chứng {symptom}. Triệu chứng "
+                        "này ở mức độ nào? Dựa vào `describe` và hình ảnh, khung hình video "
+                        "(nếu có)."
+                    ),
+                    "criteria": SEVERITY_LEVELS,
+                }
+            else:
+                questions[question_id] = {
+                    "type": "score",
+                    "instructions": (
+                        f"Thú cưng có triệu chứng {symptom} không, và ở mức độ nào? Dựa vào "
+                        "`selected_symptoms`, `describe` và hình ảnh, khung hình video "
+                        "(nếu có)."
+                    ),
+                    "criteria": PRESENCE_LEVELS,
+                }
+            symptom_questions[question_id] = row["symptom_id"]
+
+        return questions, symptom_questions
+
+    async def _decide(self, state: List[Any], questions: Dict[str, Any]) -> Dict[str, Any]:
+        """Send one Decisions API request to Jev and return its answers keyed by question id."""
+        logger.info(f"Calling Jev model {self.model_name} with {len(questions)} questions...")
+        async with httpx.AsyncClient(timeout=JEV_TIMEOUT_SECONDS) as client:
+            response = await client.post(
+                self.decisions_url,
+                headers=self.decisions_headers,
+                json={"model": self.model_name, "state": state, "questions": questions},
+            )
+
+        if response.status_code != 200:
+            try:
+                message = response.json()["error"]["message"]
+            except Exception:
+                message = response.text[:500]
+            raise RuntimeError(f"Jev request failed (HTTP {response.status_code}): {message}")
+
+        result = response.json()
+        answers = result.get("answers") or {}
+        missing = sorted(set(questions) - set(answers))
+        if missing:
+            raise RuntimeError(f"Jev returned no answer for: {', '.join(missing)}")
+
+        usage = result.get("usage") or {}
+        logger.info(
+            f"Jev ({result.get('model')}) answered {len(answers)} questions: "
+            f"{usage.get('input_tokens')} input tokens, cost {usage.get('cost')} USD"
+        )
+        return answers
+
+    def _symptom_intensity(self, answer: Dict[str, Any], confirmed: bool) -> int:
+        """Turn a symptom score answer into an intensity 1-3, or 0 when absent."""
+        probabilities = {
+            int(level): float(p) for level, p in (answer.get("probabilities") or {}).items()
+        }
+        if not probabilities:
+            probabilities = {round(answer["score"]): 1.0}
+
+        if confirmed:
+            # Severity scale: levels 0-2 are intensities 1-3.
+            return max(probabilities, key=probabilities.get) + 1
+
+        # Presence scale: level 0 is "absent", levels 1-3 are the intensities.
+        if 1 - probabilities.get(0, 0.0) < self.symptom_threshold:
+            return 0
+        return max((1, 2, 3), key=lambda level: probabilities.get(level, 0.0))
+
+    @staticmethod
+    def _age_code(age: Optional[float]) -> str:
+        """Bucket the age in years: A01 < 1, A02 1-7, A03 > 7, A00 unknown."""
+        # A plain threshold check, which Jev's docs advise keeping in code.
+        if age is None or age < 0:
+            return "A00"
+        if age < 1:
+            return "A01"
+        if age <= 7:
+            return "A02"
+        return "A03"
+
+    @staticmethod
+    def _triage_reasoning(
+        color_code: str,
+        probability: Optional[float],
+        symptoms: List[Dict[str, Any]],
+        names: Dict[str, str],
+    ) -> str:
+        """Explain the triage in Vietnamese; Jev itself returns no text."""
+        reasoning = f"Phân loại {TRIAGE_LABELS.get(color_code, color_code)} ({color_code})"
+        if probability is not None:
+            reasoning += f" với xác suất {probability:.0%}"
+
+        notable = sorted(symptoms, key=lambda item: -item["intensity"])[:3]
+        if not notable:
+            return f"{reasoning}. Không ghi nhận triệu chứng nào trong danh mục."
+        listed = ", ".join(
+            f"{names[item['symptom']]} ({INTENSITY_LABELS[item['intensity']]})"
+            for item in notable
+        )
+        return f"{reasoning}. Triệu chứng nổi bật: {listed}."
 
     async def process_inputs(
         self,
@@ -266,160 +558,60 @@ QUY TẮC ĐẦU RA:
         video_files: Optional[List[Tuple[str, bytes]]] = None,
     ) -> CompiledExtractionOutput:
         """
-        Process multimodal inputs through OpenRouter DeepSeek V4.1-Flash and return CompiledExtractionOutput (data-02.jsonc).
+        Ask Jev (OpenRouter Decisions API) to normalise a case and return CompiledExtractionOutput (data-02.jsonc).
         """
-        content_parts: List[Dict[str, Any]] = []
-        temp_paths: List[str] = []
+        catalog = self.get_symptoms_context()
+        names = {row["symptom_id"]: row["symptom_name"] for row in catalog}
+        selected = {
+            code.strip().upper() for code in initial_symptoms or [] if code and code.strip()
+        }
+        unknown = sorted(selected - names.keys())
+        if unknown:
+            logger.warning(f"Ignoring symptom codes missing from the catalog: {unknown}")
 
-        try:
-            # 1. Add Pet Info & initial symptoms & text description
-            pet_info_dict = pet_info.model_dump()
-            input_text_summary = {
-                "pet-info": pet_info_dict,
-                "selected_symptoms": initial_symptoms or [],
-                "describe": description or "",
-            }
-            content_parts.append({
-                "type": "text",
-                "text": f"Dữ liệu đầu vào ca bệnh:\n{json.dumps(input_text_summary, ensure_ascii=False, indent=2)}"
-            })
+        # 1. State: the case as JSON text, then every image and video frame
+        case = {
+            "pet-info": pet_info.model_dump(),
+            "selected_symptoms": [
+                f"{row['symptom_id']} - {row['symptom_name']}"
+                for row in catalog
+                if row["symptom_id"] in selected
+            ],
+            "describe": description or "",
+        }
+        state: List[Any] = [
+            "Dữ liệu ca bệnh (cân nặng tính bằng kg, tuổi tính bằng năm):\n"
+            + json.dumps(case, ensure_ascii=False, indent=2)
+        ]
+        for url in self._collect_image_urls(images, videos, image_files, video_files):
+            state.append({"type": "image_url", "image_url": {"url": url}})
 
-            # 2. Add Images from string list (base64 data URIs, URLs, or local paths)
-            if images:
-                for img_item in images[:5]:
-                    if not img_item or not isinstance(img_item, str):
-                        continue
-                    img_str = img_item.strip()
-                    if img_str.startswith("data:image/") or img_str.startswith("http://") or img_str.startswith("https://"):
-                        content_parts.append({"type": "image_url", "image_url": {"url": img_str}})
-                    elif os.path.exists(img_str):
-                        try:
-                            with open(img_str, "rb") as f:
-                                data_url = self._encode_image(f.read())
-                                if data_url:
-                                    content_parts.append({"type": "image_url", "image_url": {"url": data_url}})
-                        except Exception as e:
-                            logger.warning(f"Error reading image from path {img_str}: {e}")
-                    else:
-                        # Raw base64 string
-                        content_parts.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_str}"}})
+        # 2. One typed question per field Jev has to judge
+        questions, symptom_questions = self._build_questions(pet_info, catalog, selected)
+        answers = await self._decide(state, questions)
 
-            # 3. Add Images from multipart files (max 5)
-            if image_files:
-                for filename, img_bytes in image_files[:5]:
-                    ext = os.path.splitext(filename)[1].lower()
-                    if ext in SUPPORTED_IMAGE_EXTS:
-                        data_url = self._encode_image(img_bytes)
-                        if data_url:
-                            content_parts.append({"type": "image_url", "image_url": {"url": data_url}})
-                    else:
-                        logger.warning(f"Skipping unsupported image format: {filename}")
+        # 3. Assemble data-02 from the answers
+        symptoms = []
+        for question_id, symptom_id in symptom_questions.items():
+            intensity = self._symptom_intensity(answers[question_id], symptom_id in selected)
+            if intensity:
+                symptoms.append({"symptom": symptom_id, "intensity": intensity})
 
-            # 4. Add Videos from string list (local paths or base64)
-            if videos:
-                for vid_item in videos[:2]:
-                    if not vid_item or not isinstance(vid_item, str):
-                        continue
-                    vid_str = vid_item.strip()
-                    if vid_str.startswith("https://"):
-                        try:
-                            tmp_path = self._download_cloudinary_video(vid_str)
-                            if tmp_path:
-                                temp_paths.append(tmp_path)
-                                frames = self._extract_video_frames(tmp_path)
-                                for frame_b64 in frames:
-                                    content_parts.append({
-                                        "type": "image_url",
-                                        "image_url": {"url": f"data:image/jpeg;base64,{frame_b64}"}
-                                    })
-                        except Exception as e:
-                            logger.warning(f"Error downloading remote video: {e}")
-                    elif os.path.exists(vid_str):
-                        frames = self._extract_video_frames(vid_str)
-                        for frame_b64 in frames:
-                            content_parts.append({
-                                "type": "image_url",
-                                "image_url": {"url": f"data:image/jpeg;base64,{frame_b64}"}
-                            })
-                    elif vid_str.startswith("data:video/") or len(vid_str) > 100:
-                        # Decode base64 to temp file
-                        try:
-                            raw_b64 = vid_str.split(",", 1)[-1]
-                            raw_bytes = base64.b64decode(raw_b64)
-                            with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
-                                tmp.write(raw_bytes)
-                                tmp_path = tmp.name
-                                temp_paths.append(tmp_path)
-                            frames = self._extract_video_frames(tmp_path)
-                            for frame_b64 in frames:
-                                content_parts.append({
-                                    "type": "image_url",
-                                    "image_url": {"url": f"data:image/jpeg;base64,{frame_b64}"}
-                                })
-                        except Exception as e:
-                            logger.warning(f"Error decoding video base64: {e}")
+        triage = answers["triage"]
+        color_code = triage["choice"]
+        probability = (triage.get("probabilities") or {}).get(color_code)
 
-            # 5. Add Videos from multipart files (max 2)
-            if video_files:
-                for filename, vid_bytes in video_files[:2]:
-                    ext = os.path.splitext(filename)[1].lower()
-                    if ext in SUPPORTED_VIDEO_EXTS:
-                        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
-                            tmp.write(vid_bytes)
-                            tmp_path = tmp.name
-                            temp_paths.append(tmp_path)
-                        frames = self._extract_video_frames(tmp_path)
-                        for frame_b64 in frames:
-                            content_parts.append({
-                                "type": "image_url",
-                                "image_url": {"url": f"data:image/jpeg;base64,{frame_b64}"}
-                            })
-                    else:
-                        logger.warning(f"Skipping unsupported video format: {filename}")
-
-            messages = [
-                {"role": "system", "content": self._build_system_instruction()},
-                {"role": "user", "content": content_parts},
-            ]
-
-            request_kwargs = dict(
-                model=self.model_name,
-                messages=messages,
-                response_format={"type": "json_object"},
-                temperature=0.1,
-                max_tokens=3500,
-                extra_body={"reasoning": {"effort": "low"}},
-            )
-
-            logger.info(f"Calling OpenRouter model {self.model_name}...")
-            response = self.client.chat.completions.create(**request_kwargs)
-
-            choice = response.choices[0]
-            content = choice.message.content
-
-            # Fallback if model placed answer in reasoning or choice.message
-            if not content:
-                reasoning = getattr(choice.message, "reasoning", "") or ""
-                m = re.search(r"(\{.*\})", reasoning, re.DOTALL)
-                if m:
-                    content = m.group(1)
-
-            if not content:
-                raise ValueError("DeepSeek returned an empty response.")
-
-            # Clean markdown code blocks if any
-            clean_content = content.strip()
-            if clean_content.startswith("```"):
-                clean_content = re.sub(r"^```[a-zA-Z]*\n?", "", clean_content)
-                clean_content = re.sub(r"\n?```$", "", clean_content).strip()
-
-            logger.info("DeepSeek returned output. Validating into CompiledExtractionOutput...")
-            return CompiledExtractionOutput.model_validate_json(clean_content)
-
-        finally:
-            for p in temp_paths:
-                if os.path.exists(p):
-                    try:
-                        os.remove(p)
-                    except Exception:
-                        pass
+        logger.info("Jev returned answers. Validating into CompiledExtractionOutput...")
+        return CompiledExtractionOutput.model_validate({
+            "pet-info": {
+                "breed": answers["breed"]["choice"],
+                "gender": answers["gender"]["choice"],
+                "weight": answers["weight"]["choice"] if "weight" in answers else "W00",
+                "age": self._age_code(pet_info.age),
+            },
+            "symptoms": symptoms,
+            "triage_result": {
+                "color_code": color_code,
+                "reasoning": self._triage_reasoning(color_code, probability, symptoms, names),
+            },
+        })

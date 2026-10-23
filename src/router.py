@@ -19,7 +19,7 @@ from src.db import (
     update_disease,
     update_symptom,
 )
-from src.extractor import DeepSeekSymptomExtractor
+from src.extractor import JevSymptomExtractor
 from src.matrix_engine import MatrixEngine
 from src.schemas import (
     AskRequest,
@@ -48,10 +48,10 @@ router = APIRouter()
 matrix_engine = MatrixEngine()
 
 try:
-    extractor: Optional[DeepSeekSymptomExtractor] = DeepSeekSymptomExtractor()
+    extractor: Optional[JevSymptomExtractor] = JevSymptomExtractor()
 except Exception as exc:  # pragma: no cover - missing/invalid OpenRouter config
-    # The catalog and matrix endpoints stay usable without an LLM key; only
-    # /diagnose needs the extractor, and it reports the problem at call time.
+    # The catalog and matrix endpoints stay usable without an OpenRouter key;
+    # only /diagnose and /ask need the extractor, and they report it at call time.
     logger.error("Could not initialise the symptom extractor: %s", exc)
     extractor = None
 
@@ -59,13 +59,13 @@ MAX_IMAGE_COUNT = 5
 MAX_VIDEO_COUNT = 2
 
 
-def _require_extractor() -> DeepSeekSymptomExtractor:
+def _require_extractor() -> JevSymptomExtractor:
     if extractor is None:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=(
-                "Chưa cấu hình được OpenRouter (kiểm tra OPENROUTER_API_KEY "
-                "trong file .env)."
+                "Chưa cấu hình được Jev qua OpenRouter (kiểm tra OPENROUTER_API_KEY "
+                "và các biến OPENROUTER_* / JEV_* trong file .env)."
             ),
         )
     return extractor
@@ -695,6 +695,7 @@ async def health() -> Dict[str, Any]:
         "extractor": {
             "ok": extractor is not None,
             "model": getattr(extractor, "model_name", None),
+            "chat_model": getattr(extractor, "chat_model_name", None),
         },
         "matrix": {
             "diseases": len(matrix_engine.matrix_data.get("diseases", {})),
