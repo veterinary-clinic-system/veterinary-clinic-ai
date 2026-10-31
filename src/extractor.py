@@ -171,6 +171,8 @@ class JevSymptomExtractor:
             response_format={"type": "json_object"},
             temperature=0.3,
             max_tokens=1200,
+            # Some OpenAI-compatible proxies stream unless told otherwise.
+            stream=False,
             extra_body={"reasoning": {"effort": "low"}},
         )
         content = (response.choices[0].message.content or "").strip()
