@@ -15,7 +15,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # Ma tran bi ghi lai khi chay (online learning, sua tren dashboard) nen nam tren
-# volume /app/state; MatrixEngine tu chep ban CSV di kem image vao khi volume trong.
+# volume /app/state; MatrixEngine chep ban CSV di kem image vao khi volume trong,
+# hoac khi image moi mang ban CSV khac (ban cu duoc giu lai thanh .bak-<thoi gian>).
 ENV MATRIX_CSV_PATH=/app/state/symptom_disease_matrix.csv
 VOLUME /app/state
 

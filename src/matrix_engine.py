@@ -1,9 +1,11 @@
 import csv
+import hashlib
 import logging
 import math
 import os
 import re
 import shutil
+import time
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -28,17 +30,47 @@ class MatrixEngine:
         self._load_matrix()
 
     def _initialize_external_matrix(self) -> None:
-        """Seed an empty persistent-disk path from the bundled matrix."""
-        if os.path.exists(self.csv_path) or self.csv_path == _BUNDLED_CSV_PATH:
+        """Seed the persistent-disk copy from the bundled matrix.
+
+        `<csv>.seed` records the SHA-256 of the bundled matrix the copy came
+        from. Runtime edits (online learning, dashboard) are kept across
+        restarts, but when an image ships a different bundled matrix the copy
+        is replaced, so matrix fixes reach existing volumes; the previous copy
+        is kept as `<csv>.bak-<timestamp>`.
+        """
+        if os.path.abspath(self.csv_path) == os.path.abspath(_BUNDLED_CSV_PATH):
             return
 
         if not os.path.exists(_BUNDLED_CSV_PATH):
             return
 
+        with open(_BUNDLED_CSV_PATH, "rb") as file:
+            # Line endings depend on the checkout (CRLF on Windows), not on the matrix.
+            bundled_hash = hashlib.sha256(file.read().replace(b"\r\n", b"\n")).hexdigest()
+        stamp_path = f"{self.csv_path}.seed"
+
+        if os.path.exists(self.csv_path):
+            try:
+                with open(stamp_path, "r", encoding="utf-8") as file:
+                    if file.read().strip() == bundled_hash:
+                        return
+            except FileNotFoundError:
+                pass
+
+            backup_path = f"{self.csv_path}.bak-{time.strftime('%Y%m%d-%H%M%S')}"
+            shutil.copyfile(self.csv_path, backup_path)
+            logger.warning(
+                "Bundled matrix changed: replacing %s (previous copy kept at %s)",
+                self.csv_path,
+                backup_path,
+            )
+
         parent_dir = os.path.dirname(self.csv_path)
         if parent_dir:
             os.makedirs(parent_dir, exist_ok=True)
         shutil.copyfile(_BUNDLED_CSV_PATH, self.csv_path)
+        with open(stamp_path, "w", encoding="utf-8") as file:
+            file.write(bundled_hash)
         logger.info("Seeded matrix file at %s", self.csv_path)
 
     # Column groups in the flat CSV
