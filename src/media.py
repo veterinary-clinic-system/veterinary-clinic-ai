@@ -1,10 +1,8 @@
 """Load the images and videos attached to a case and package them for the vision model.
 
-Everything goes to the vision model as an `image_url` data URL: images as
-JPEG, videos as the original file when it is small enough, otherwise
-re-encoded into a short low-resolution clip. The 9router gateway forwards a
-video only in that form (it silently drops `video_url` / `file` parts, and
-the model then describes a video it never saw), so nothing else is sent.
+Everything goes to the vision model as an `image_url` JPEG data URL. The
+OpenRouter vision model (DeepSeek V4.1 Flash) accepts text and images only, so
+a video is sent as a few evenly spaced still frames - without its sound.
 """
 import base64
 import io
@@ -29,26 +27,13 @@ MAX_REMOTE_VIDEO_BYTES = 100 * 1024 * 1024
 
 IMAGE_MAX_SIDE = 1568
 
-# Videos up to this size are sent whole, sound included. Upload and model time
-# grow with the file (a 16 MB clip took ~25 s) while the backend gives the whole
-# diagnosis 60 s, so bigger videos are re-encoded first.
-INLINE_VIDEO_MAX_BYTES = 10 * 1024 * 1024
-INLINE_VIDEO_MIME = {
-    ".mp4": "video/mp4",
-    ".mov": "video/mov",
-    ".webm": "video/webm",
-    ".avi": "video/avi",
-}
-COMPACT_VIDEO_FPS = 2
-COMPACT_VIDEO_MAX_FRAMES = 60  # 30 s at 2 fps; longer videos are sampled evenly
-COMPACT_VIDEO_MAX_SIDE = 480
-FALLBACK_VIDEO_FRAMES = 6
+VIDEO_FRAMES = 6
 
 
 @dataclass
 class MediaItem:
     label: str  # "Ảnh 1", "Video 1", ... - the vision model cites these
-    kind: str  # "image" or "video"
+    kind: str  # "image" (video frames are images too)
     data_url: str
 
 
@@ -181,43 +166,7 @@ def _read_frames(path: str, indices: List[int]):
         cap.release()
 
 
-def compact_video(path: str) -> Optional[bytes]:
-    """Re-encode a video as a small silent MP4: 2 fps, 480 px, at most 60 frames."""
-    import cv2
-
-    indices, _ = _frame_indices(path, COMPACT_VIDEO_FPS, COMPACT_VIDEO_MAX_FRAMES)
-    out_path = _write_temp(b"", ".mp4")
-    writer = None
-    written = 0
-    try:
-        for frame in _read_frames(path, indices):
-            frame = _shrink(frame, COMPACT_VIDEO_MAX_SIDE)
-            if writer is None:
-                height, width = frame.shape[:2]
-                writer = cv2.VideoWriter(
-                    out_path, cv2.VideoWriter_fourcc(*"mp4v"), COMPACT_VIDEO_FPS, (width, height)
-                )
-                if not writer.isOpened():
-                    return None
-            writer.write(frame)
-            written += 1
-        if writer is None or written == 0:
-            return None
-        writer.release()
-        writer = None
-        with open(out_path, "rb") as file:
-            return file.read() or None
-    except Exception as exc:
-        logger.warning("Could not re-encode video: %s", exc)
-        return None
-    finally:
-        if writer is not None:
-            writer.release()
-        if os.path.exists(out_path):
-            os.remove(out_path)
-
-
-def sample_frames(path: str, count: int = FALLBACK_VIDEO_FRAMES) -> List[bytes]:
+def sample_frames(path: str, count: int = VIDEO_FRAMES) -> List[bytes]:
     """Sample `count` evenly spaced frames as JPEG bytes."""
     import cv2
 
@@ -231,22 +180,7 @@ def sample_frames(path: str, count: int = FALLBACK_VIDEO_FRAMES) -> List[bytes]:
 
 
 def _video_items(path: str, ext: str, label: str) -> List[MediaItem]:
-    """Package one video: whole when small, else re-encoded, else a few still frames."""
-    mime = INLINE_VIDEO_MIME.get(ext)
-    if mime and os.path.getsize(path) <= INLINE_VIDEO_MAX_BYTES:
-        with open(path, "rb") as file:
-            data = base64.b64encode(file.read()).decode("ascii")
-        return [MediaItem(label, "video", f"data:{mime};base64,{data}")]
-
-    compact = compact_video(path)
-    if compact:
-        data = base64.b64encode(compact).decode("ascii")
-        return [MediaItem(
-            f"{label} (đã nén còn {COMPACT_VIDEO_FPS} khung hình/giây, không có âm thanh)",
-            "video",
-            f"data:video/mp4;base64,{data}",
-        )]
-
+    """Package one video as evenly spaced still frames (the vision model reads no video)."""
     frames = [url for url in (encode_image(frame) for frame in sample_frames(path)) if url]
     return [
         MediaItem(f"{label} - khung hình {i}/{len(frames)}", "image", url)

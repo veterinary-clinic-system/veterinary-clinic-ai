@@ -2,12 +2,12 @@
 
 `process_inputs` runs three model steps:
 
-1. Media - a vision LLM (`LLM_VISION_MODELS`, Gemini through 9router) reads the
-   attached images and videos and writes plain-text findings.
+1. Media - a vision LLM (`LLM_VISION_MODELS`, DeepSeek through OpenRouter) reads
+   the attached images and video frames and writes plain-text findings.
 2. Jev - TypeSafe's decision model answers typed questions about the case text
-   and those findings through a System One endpoint (`JEV_URL`).
-3. Fallback - when Jev fails (for example the free plan's quota is used up and
-   it answers HTTP 429), a generative LLM (`LLM_FALLBACK_MODELS`) writes the same
+   and those findings through OpenRouter's Decisions API (`JEV_URL`).
+3. Fallback - when Jev fails (quota, rate limit, timeout...), a generative LLM
+   (`LLM_FALLBACK_MODELS`) writes the same
    data-02 as JSON, so triage keeps working and attachments are still read.
 
 Each LLM step tries its models in order and moves on when one fails.
@@ -32,17 +32,14 @@ from src.schemas import CompiledExtractionOutput, PetInfoInput
 load_dotenv()
 logger = logging.getLogger(__name__)
 
-DEFAULT_JEV_MODEL = "oc/jev-1.13-free"
-DEFAULT_VISION_MODELS = "ag/gemini-3.8-flash-high,oc/nemotron-3.5-super-vl-free"
-# Text-only steps try the low-reasoning Gemini before the high one: on the
-# extraction prompt `-high` took 19-57 s (up to 7k reasoning tokens) against
-# 3-4 s for `-low`, with the same symptoms and triage colours.
-DEFAULT_FALLBACK_MODELS = (
-    "oc/nemotron-3.5-super-vl-free,ag/gemini-3.8-flash-low,ag/gemini-3.8-flash-high"
-)
-DEFAULT_CHAT_MODELS = (
-    "oc/nemotron-3.5-super-vl-free,ag/gemini-3.8-flash-low,ag/gemini-3.8-flash-high"
-)
+DEFAULT_LLM_BASE_URL = "https://openrouter.ai/api/v1"
+# Jev is not served on /chat/completions: OpenRouter exposes it on the Decisions API.
+DEFAULT_JEV_URL = "https://openrouter.ai/api/alpha/decisions"
+DEFAULT_JEV_MODEL = "typesafe/jev-1.14"
+# DeepSeek V4.1 Flash reads text and images (not video - see src/media.py).
+DEFAULT_VISION_MODELS = "deepseek/deepseek-v4.1-flash-1017"
+DEFAULT_FALLBACK_MODELS = "deepseek/deepseek-v4.1-flash-1017"
+DEFAULT_CHAT_MODELS = "deepseek/deepseek-v4.1-flash-1017"
 
 # Per-call limits. The backend waits 60 s for the whole diagnosis; the usual
 # path (media ~10-25 s, Jev a few seconds or an instant 429, fallback ~4 s) fits.
@@ -163,7 +160,7 @@ _WRAPPED_ERROR = re.compile(r"^\[\d{3}\]:\s*(\{.*\})\s*$", re.DOTALL)
 
 
 def _error_text(body: Any) -> str:
-    """A readable message from an OpenAI-style, TypeSafe-style or 9router error body."""
+    """A readable message from an OpenAI-style or TypeSafe-style error body."""
     if isinstance(body, dict):
         error = body.get("error")
         if isinstance(error, dict):
@@ -183,7 +180,7 @@ def _error_text(body: Any) -> str:
         elif "message" in body:
             body = body["message"]
     text = body if isinstance(body, str) else json.dumps(body, ensure_ascii=False)
-    # 9router wraps the upstream error as "[429]: {...json...}".
+    # Some gateways wrap the upstream error as "[429]: {...json...}".
     match = _WRAPPED_ERROR.match(text.strip())
     if match:
         try:
@@ -232,14 +229,16 @@ class JevSymptomExtractor:
 
     def __init__(self):
         # The OPENROUTER_* names are read too, so older deployments keep working.
-        self.llm_base_url = _env("LLM_BASE_URL", "OPENROUTER_BASE_URL").rstrip("/")
+        self.llm_base_url = (
+            _env("LLM_BASE_URL", "OPENROUTER_BASE_URL") or DEFAULT_LLM_BASE_URL
+        ).rstrip("/")
         self.llm_api_key = _env("LLM_API_KEY", "OPENROUTER_API_KEY")
-        if not self.llm_base_url or not self.llm_api_key:
-            raise ValueError("LLM_BASE_URL and LLM_API_KEY are missing from .env")
+        if not self.llm_api_key:
+            raise ValueError("LLM_API_KEY (OpenRouter key) is missing from .env")
 
-        # Jev is a decision model: it answers typed questions on a System One
-        # endpoint instead of /chat/completions.
-        self.jev_url = _env("JEV_URL", "OPENROUTER_DECISIONS_URL") or f"{self.llm_base_url}/systemone"
+        # Jev is a decision model: it answers typed questions on the Decisions
+        # API instead of /chat/completions.
+        self.jev_url = _env("JEV_URL", "OPENROUTER_DECISIONS_URL") or DEFAULT_JEV_URL
         self.jev_api_key = _env("JEV_API_KEY") or self.llm_api_key
         self.jev_model = _env("JEV_MODEL", "OPENROUTER_JEV_MODEL") or DEFAULT_JEV_MODEL
         self.symptom_threshold = float(_env("JEV_SYMPTOM_THRESHOLD") or 0.5)
