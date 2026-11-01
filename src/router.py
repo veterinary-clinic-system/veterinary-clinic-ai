@@ -3,7 +3,6 @@ import os
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Body, HTTPException, Path, status
-from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
 
 from src.db import (
@@ -49,8 +48,8 @@ matrix_engine = MatrixEngine()
 
 try:
     extractor: Optional[JevSymptomExtractor] = JevSymptomExtractor()
-except Exception as exc:  # pragma: no cover - missing/invalid OpenRouter config
-    # The catalog and matrix endpoints stay usable without an OpenRouter key;
+except Exception as exc:  # pragma: no cover - missing/invalid model gateway config
+    # The catalog and matrix endpoints stay usable without the model gateway;
     # only /diagnose and /ask need the extractor, and they report it at call time.
     logger.error("Could not initialise the symptom extractor: %s", exc)
     extractor = None
@@ -64,8 +63,8 @@ def _require_extractor() -> JevSymptomExtractor:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=(
-                "Chưa cấu hình được Jev qua OpenRouter (kiểm tra OPENROUTER_API_KEY "
-                "và các biến OPENROUTER_* / JEV_* trong file .env)."
+                "Chưa cấu hình được mô hình AI (kiểm tra LLM_BASE_URL, LLM_API_KEY "
+                "và các biến JEV_* / LLM_* trong file .env)."
             ),
         )
     return extractor
@@ -100,14 +99,15 @@ async def _process_diagnosis_pipeline(
     request_data: DiagnosisRequest,
     image_files: Optional[List[Tuple[str, bytes]]] = None,
     video_files: Optional[List[Tuple[str, bytes]]] = None,
-) -> Tuple[DiagnosisResponse, Dict[str, Any], Optional[List[Dict[str, Any]]]]:
+) -> Tuple[DiagnosisResponse, Dict[str, Any], Optional[List[Dict[str, Any]]], Dict[str, Any]]:
     """Run the diagnosis pipeline.
 
-    Returns the `data-03` response plus the intermediate `data-02` payload and
-    any weight adjustments, so callers can expose the full audit trail.
+    Returns the `data-03` response plus the intermediate `data-02` payload, any
+    weight adjustments and the extractor's `analysis` record (which models ran,
+    what the vision model saw), so callers can expose the full audit trail.
     """
 
-    compiled_output = await _require_extractor().process_inputs(
+    compiled_output, analysis = await _require_extractor().process_inputs(
         pet_info=request_data.pet_info,
         initial_symptoms=request_data.symptoms,
         description=request_data.describe,
@@ -155,7 +155,7 @@ async def _process_diagnosis_pipeline(
     except Exception as exc:
         logger.error("Failed to save diagnosis log: %s", exc)
 
-    return response, data_02, weight_adjustments
+    return response, data_02, weight_adjustments, analysis
 
 
 def _validate_media_counts(request_data: DiagnosisRequest) -> None:
@@ -183,7 +183,7 @@ async def diagnose_endpoint(
     _validate_media_counts(request_data)
 
     try:
-        response, _, _ = await _process_diagnosis_pipeline(request_data)
+        response, _, _, _ = await _process_diagnosis_pipeline(request_data)
         return response
     except HTTPException:
         raise
@@ -212,13 +212,15 @@ async def diagnose_detailed_endpoint(
 
     The extra fields are the compiled `data-02` payload (normalised pet info,
     the symptoms the model actually extracted and the triage reasoning), the
-    disease names resolved from the catalog, and any online-learning weight
-    adjustments applied to the matrix.
+    disease names resolved from the catalog, any online-learning weight
+    adjustments applied to the matrix, and `analysis`: whether Jev or the
+    fallback LLM compiled the case and what the vision model read from the
+    attachments.
     """
     _validate_media_counts(request_data)
 
     try:
-        response, compiled, adjustments = await _process_diagnosis_pipeline(
+        response, compiled, adjustments, analysis = await _process_diagnosis_pipeline(
             request_data,
         )
     except HTTPException:
@@ -256,6 +258,7 @@ async def diagnose_detailed_endpoint(
         triage_result=response.triage_result,
         compiled=compiled,
         weight_adjustments=adjustments,
+        analysis=analysis,
     )
 
 
@@ -268,8 +271,7 @@ async def diagnose_detailed_endpoint(
 async def ask_pet_care_endpoint(request_data: AskRequest) -> AskResponse:
     ex = _require_extractor()
     try:
-        result = await run_in_threadpool(
-            ex.answer_pet_care_question,
+        result = await ex.answer_pet_care_question(
             request_data.question,
             [item.model_dump() for item in request_data.history],
         )
@@ -694,8 +696,10 @@ async def health() -> Dict[str, Any]:
         "database": database,
         "extractor": {
             "ok": extractor is not None,
-            "model": getattr(extractor, "model_name", None),
-            "chat_model": getattr(extractor, "chat_model_name", None),
+            "jev_model": getattr(extractor, "jev_model", None),
+            "vision_models": getattr(extractor, "vision_models", None),
+            "fallback_models": getattr(extractor, "fallback_models", None),
+            "chat_models": getattr(extractor, "chat_models", None),
         },
         "matrix": {
             "diseases": len(matrix_engine.matrix_data.get("diseases", {})),

@@ -187,6 +187,9 @@ class DiagnosisDetailResponse(BaseModel):
     triage_result: TriageResult
     compiled: Dict[str, Any]
     weight_adjustments: Optional[List[Dict[str, Any]]] = None
+    # Which model compiled the case ("jev" or the fallback "llm"), why Jev was
+    # skipped, and what the vision model read from the attachments.
+    analysis: Optional[Dict[str, Any]] = None
 
 
 # ---------------------------------------------------------------------------
