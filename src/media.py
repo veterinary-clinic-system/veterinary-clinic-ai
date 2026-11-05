@@ -60,11 +60,28 @@ def encode_image(file_bytes: bytes) -> Optional[str]:
     return "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
 
 
-def download_cloudinary(url: str, max_bytes: int) -> Optional[bytes]:
-    """Download a trusted Cloudinary URL, refusing anything over max_bytes."""
+def _trusted_bases() -> List[str]:
+    """URL prefixes of the clinic's own media stores: Cloudinary plus MEDIA_BASE_URLS."""
+    extra = [
+        base.strip().rstrip("/").lower() + "/"
+        for base in os.getenv("MEDIA_BASE_URLS", "").split(",")
+        if base.strip().lower().startswith("https://")
+    ]
+    return ["https://res.cloudinary.com/", *extra]
+
+
+def is_trusted_media_url(url: str) -> bool:
     parsed = urlparse(url)
-    if parsed.scheme != "https" or parsed.hostname != "res.cloudinary.com":
-        logger.warning("Skipping non-Cloudinary media URL")
+    if parsed.scheme != "https" or not parsed.hostname:
+        return False
+    lowered = url.lower()
+    return any(lowered.startswith(base) for base in _trusted_bases())
+
+
+def download_media(url: str, max_bytes: int) -> Optional[bytes]:
+    """Download a URL from a trusted media store, refusing anything over max_bytes."""
+    if not is_trusted_media_url(url):
+        logger.warning("Skipping media URL outside the trusted stores")
         return None
 
     limit_mb = max_bytes // (1024 * 1024)
@@ -79,11 +96,11 @@ def download_cloudinary(url: str, max_bytes: int) -> Optional[bytes]:
 
 
 def _image_bytes(value: str) -> Optional[bytes]:
-    """Load an image given as a data URL, Cloudinary URL, local path or raw base64."""
+    """Load an image given as a data URL, trusted store URL, local path or raw base64."""
     if value.startswith("data:image/"):
         return base64.b64decode(value.split(",", 1)[-1])
     if value.startswith(("http://", "https://")):
-        return download_cloudinary(value, MAX_REMOTE_IMAGE_BYTES)
+        return download_media(value, MAX_REMOTE_IMAGE_BYTES)
     if os.path.exists(value):
         with open(value, "rb") as file:
             return file.read()
@@ -103,7 +120,7 @@ def _video_file(value: str) -> Tuple[Optional[str], str, bool]:
         if ext not in SUPPORTED_VIDEO_EXTS:
             logger.warning("Skipping unsupported remote video format: %s", ext or "unknown")
             return None, ext, False
-        data = download_cloudinary(value, MAX_REMOTE_VIDEO_BYTES)
+        data = download_media(value, MAX_REMOTE_VIDEO_BYTES)
         return (_write_temp(data, ext), ext, True) if data else (None, ext, False)
     if os.path.exists(value):
         return value, os.path.splitext(value)[1].lower(), False
