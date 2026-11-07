@@ -61,13 +61,12 @@ def encode_image(file_bytes: bytes) -> Optional[str]:
 
 
 def _trusted_bases() -> List[str]:
-    """URL prefixes of the clinic's own media stores: Cloudinary plus MEDIA_BASE_URLS."""
-    extra = [
+    """URL prefixes of the clinic's own media store (S3 via CloudFront), from MEDIA_BASE_URLS."""
+    return [
         base.strip().rstrip("/").lower() + "/"
         for base in os.getenv("MEDIA_BASE_URLS", "").split(",")
         if base.strip().lower().startswith("https://")
     ]
-    return ["https://res.cloudinary.com/", *extra]
 
 
 def is_trusted_media_url(url: str) -> bool:
